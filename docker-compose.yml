@@ -1,0 +1,17 @@
+services:
+  api:
+    build: .
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      SLUG: ${SLUG:-williamsbarbearia}
+      BARBERSHOP_ID: ${BARBERSHOP_ID:-12611}
+      TZ: ${TZ:-America/Sao_Paulo}
+      DEFAULT_SERVICE_IDS: ${DEFAULT_SERVICE_IDS:-40451}
+      API_KEY: ${API_KEY:-}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
