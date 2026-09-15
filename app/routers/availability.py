@@ -1,8 +1,11 @@
 import asyncio
+import logging
 from datetime import date, datetime, timedelta
 from fastapi import APIRouter, HTTPException, Query
 from .. import bestbarbers, config, slots
 from ..store import cache_get, cache_set, resolve_barbeiro
+
+logger = logging.getLogger("availability")
 
 router = APIRouter(tags=["availability"])
 
@@ -56,14 +59,23 @@ async def _fetch_one(d: date, barber_id, time_required: str, service_ids: list[i
         "date": d.isoformat(),
         "currentHour": now.strftime("%H:%M"),
         "currentDate": now.strftime("%Y-%m-%d"),
-        "barber_id": barber_id,
         "barbershop_id": bb_id,
         "time_required": time_required,
         "services": service_ids,
     }
+    # "general"/sem preferência: NÃO envia a string "general" como barber_id
+    # (contrato inválido na API). Omite a chave, igual ao front quando
+    # nenhum barbeiro é selecionado.
+    if barber_id != "general":
+        payload["barber_id"] = barber_id
     try:
-        return await bestbarbers.post_available_times(payload)
+        raw = await bestbarbers.post_available_times(payload)
+        counts = slots.raw_counts(raw)
+        logger.info("[fetch] date=%s barber_id=%r turnos=%s total_bruto=%d",
+                    d, barber_id, counts, sum(counts.values()))
+        return raw
     except Exception as e:
+        logger.warning("[fetch] erro date=%s barber_id=%r: %s", d, barber_id, e)
         return {"_error": str(e), "morning": [], "evening": [], "night": []}
 
 
@@ -81,7 +93,8 @@ def _enrich(chunk: list[dict], barbers: list[dict]) -> list[dict]:
 
 
 async def _availability_core(date_s: str, barbeiro: str | None,
-                             service_ids: list[int], turno: str | None) -> dict:
+                             service_ids: list[int], turno: str | None,
+                             debug: bool = False) -> dict:
     bb, barbers, products = await _ctx()
     d = _parse_date(date_s)
     bid, label = resolve_barbeiro(barbeiro, barbers)
@@ -110,10 +123,20 @@ async def _availability_core(date_s: str, barbeiro: str | None,
                            [int(x) for x in str(config.DEFAULT_SERVICE_IDS).split(",") if x.strip().isdigit()],
                            bb.get("id", config.BARBERSHOP_ID))
 
+    def _debug_block(extra: dict | None = None) -> dict:
+        if not debug:
+            return {}
+        block = {"raw": raw, "raw_counts": slots.raw_counts(raw)}
+        if extra:
+            block.update(extra)
+        return block
+
     # Fallback sem-preferência: se barber_id=general vazio/erro, fan-out nos 3
     if bid == "general":
-        flat_try = slots.all_slots_flat(slots.normalize_slots(raw), turno)
+        flat_try = slots.all_slots_flat(slots.normalize_slots(raw, logger), turno)
         if not flat_try and not raw.get("_error"):
+            logger.warning("[general] resposta sem horários (counts=%s); fazendo fan-out nos barbeiros",
+                           slots.raw_counts(raw))
             results = await asyncio.gather(*[
                 _fetch_one(d, b["id"], time_required,
                            service_ids or [int(x) for x in str(config.DEFAULT_SERVICE_IDS).split(",") if x.strip().isdigit()],
@@ -122,22 +145,25 @@ async def _availability_core(date_s: str, barbeiro: str | None,
             ])
             merged: dict[str, dict] = {}
             for b, r in zip(barbers, results):
-                for s in slots.all_slots_flat(slots.normalize_slots(r), turno):
+                for s in slots.all_slots_flat(slots.normalize_slots(r, logger), turno):
                     merged.setdefault(s["hora"], {"hora": s["hora"], "turno": s.get("turno"),
                                                   "barber_id": b["id"], "barber_name": b.get("name")})
             livres = sorted(merged.values(), key=lambda x: x["hora"])
             livres_h = [x["hora"] for x in livres]
             _, ocup = slots.diff_grade(grade_f, livres_h)
+            logger.info("[avail] date=%s barber=%s bruto=%d -> livre=%d ocupado=%d",
+                        d, label, sum(len(slots.raw_counts(r)) for r in results), len(livres), len(ocup))
             resp = {"data": d.isoformat(), "barbeiro": label, "barber_id": "general",
                     "turno": turno, "time_required": time_required,
                     "services": [{"id": p.get("id"), "name": p.get("name")} for p in sel],
                     "disponiveis": livres, "indisponiveis": ocup,
                     "total_livre": len(livres), "total_ocupado": len(ocup),
                     "texto_ia": slots.build_texto_ia(d.isoformat(), label, turno, livres, ocup)}
+            resp.update(_debug_block({"mode": "fanout"}))
             cache_set(cache_key, resp, config.CACHE_TTL_AVAIL)
             return resp
 
-    norm = slots.normalize_slots(raw)
+    norm = slots.normalize_slots(raw, logger)
     flat = slots.all_slots_flat(norm, turno)
     livres = _enrich(flat, barbers)
     # completa nome quando consulta é de barbeiro específico
@@ -147,12 +173,16 @@ async def _availability_core(date_s: str, barbeiro: str | None,
             s["barber_name"] = s.get("barber_name") or label
     livres_h = [x["hora"] for x in livres]
     _, ocup = slots.diff_grade(grade_f, livres_h)
+    raw_total = sum(len(v) for v in norm.values())
+    logger.info("[avail] date=%s barber=%s bruto_por_turno=%s -> livre=%d ocupado=%d",
+                d, label, {k: len(v) for k, v in norm.items()}, len(livres), len(ocup))
     resp = {"data": d.isoformat(), "barbeiro": label, "barber_id": bid,
             "turno": turno, "time_required": time_required,
             "services": [{"id": p.get("id"), "name": p.get("name")} for p in sel],
             "disponiveis": livres, "indisponiveis": ocup,
             "total_livre": len(livres), "total_ocupado": len(ocup),
             "texto_ia": slots.build_texto_ia(d.isoformat(), label, turno, livres, ocup)}
+    resp.update(_debug_block({"bruto_normalizado": raw_total}))
     cache_set(cache_key, resp, config.CACHE_TTL_AVAIL)
     return resp
 
@@ -169,8 +199,9 @@ async def availability(
     barbeiro: str = Query("sem_preferencia", description="nome, id ou sem_preferencia"),
     service_ids: str = Query("", description="IDs separados por vírgula, ex 40451,41271"),
     turno: str | None = Query(None, description="manha|tarde|noite"),
+    debug: bool = Query(False, description="Inclui resposta bruta da API no retorno"),
 ):
-    return await _availability_core(date, barbeiro, _parse_ids(service_ids), turno)
+    return await _availability_core(date, barbeiro, _parse_ids(service_ids), turno, debug=debug)
 
 
 @router.get("/availability/all")
@@ -178,6 +209,7 @@ async def availability_all(
     date: str = Query(..., description="YYYY-MM-DD"),
     service_ids: str = Query("", description="IDs separados por vírgula"),
     turno: str | None = Query(None, description="manha|tarde|noite"),
+    debug: bool = Query(False, description="Inclui resposta bruta da API no retorno"),
 ):
     """Os 3 barbeiros + sem preferência de uma vez (ideal p/ IA comparar)."""
     bb, barbers, _ = await _ctx()
@@ -186,7 +218,7 @@ async def availability_all(
     out = {}
     for t in targets:
         try:
-            out[t] = await _availability_core(date, t, ids, turno)
+            out[t] = await _availability_core(date, t, ids, turno, debug=debug)
         except HTTPException as e:
             out[t] = {"error": e.detail}
     # atalho sem_preferencia
@@ -201,6 +233,7 @@ async def availability_range(
     barbeiro: str = Query("sem_preferencia"),
     service_ids: str = Query(""),
     turno: str | None = Query(None),
+    debug: bool = Query(False),
 ):
     d0 = _parse_date(start)
     ids = _parse_ids(service_ids)
@@ -208,7 +241,7 @@ async def availability_range(
     for i in range(days):
         di = (d0 + timedelta(days=i)).isoformat()
         try:
-            r = await _availability_core(di, barbeiro, ids, turno)
+            r = await _availability_core(di, barbeiro, ids, turno, debug=debug)
         except HTTPException as e:
             r = {"data": di, "error": e.detail}
         dias.append(r)

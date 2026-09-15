@@ -18,6 +18,10 @@ CACHE_TTL_AVAIL = int(os.getenv("CACHE_TTL_AVAIL", "60"))
 # Auth opcional: se API_KEY setada, exige header X-API-Key (exceto /health e /docs)
 API_KEY = os.getenv("API_KEY", "")
 
+# Logging: DEBUG inclui logs detalhados de contagem bruta x final da API.
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+DEBUG = os.getenv("DEBUG", "0") in ("1", "true", "True", "yes")
+
 # Intervalo padrão da grade (min). O valor real vem da API (agenda_time_interval).
 FALLBACK_INTERVAL_MIN = int(os.getenv("AGENDA_INTERVAL", "40"))
 MAX_RANGE_DAYS = int(os.getenv("MAX_RANGE_DAYS", "14"))

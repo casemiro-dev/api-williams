@@ -69,18 +69,76 @@ def build_grade(opening: dict, interval_min: int) -> list[str]:
     return out
 
 
-def normalize_slots(raw: dict) -> dict[str, list[dict]]:
-    """Achata {morning,everything} em {turno: [{hora, barber_id}]}."""
+# Alias de chave de turno aceitos da API (o site usa morning/evening/night,
+# mas aceitamos variantes como "afternoon" para nunca perder a grade).
+TURNO_KEY_ALIASES = {
+    "morning": ("morning", "manha", "morning_slots"),
+    "evening": ("evening", "afternoon", "tarde"),
+    "night": ("night", "noite"),
+}
+
+# Chaves de horário possíveis dentro de cada item retornado pela API.
+TIME_KEYS = ("hour", "time", "time_str", "start_time", "start_hour",
+             "value", "hora", "slot", "label")
+
+
+def _item_hora(item) -> str | None:
+    """Extrai o horário (HH:MM) de um item string ou dict, sem descartar."""
+    if isinstance(item, str):
+        return item[:5]
+    if isinstance(item, dict):
+        for k in TIME_KEYS:
+            v = item.get(k)
+            if v:
+                return str(v)[:5]
+        # nenhuma chave de tempo conhecida: preserva o valor bruto p/ não perder
+        return str(item)[:5]
+    return None
+
+
+def normalize_slots(raw: dict, log=None) -> dict[str, list[dict]]:
+    """Achata {morning, evening, night} em {turno: [{hora, barber_id}]}.
+
+    Nunca descarta itens silenciosamente: chaves de turno desconhecidas e
+    itens sem horário reconhecível são registrados (se um `log` for passado).
+    """
     norm: dict[str, list[dict]] = {"morning": [], "evening": [], "night": []}
-    for turno in norm:
-        for item in (raw or {}).get(turno, []) or []:
-            if isinstance(item, str):
-                norm[turno].append({"hora": item[:5], "barber_id": None})
-            elif isinstance(item, dict):
-                hora = str(item.get("hour", ""))[:5]
+    if not raw:
+        return norm
+    seen = set()
+    for turno, aliases in TURNO_KEY_ALIASES.items():
+        for alias in aliases:
+            if alias not in raw:
+                continue
+            for item in raw[alias] or []:
+                hora = _item_hora(item)
+                seen.add(item if isinstance(item, (int, str)) else repr(item))
                 if hora:
-                    norm[turno].append({"hora": hora, "barber_id": item.get("barber_id")})
+                    norm[turno].append({
+                        "hora": hora,
+                        "barber_id": item.get("barber_id") if isinstance(item, dict) else None,
+                    })
+                elif log:
+                    log.warning("[normalize] item sem horário preservado? turno=%s item=%r", turno, item)
+    # chaves de turno que a API retornou mas não conhecemos (ex: outro nome)
+    for key in raw:
+        if key in {"_error"}:
+            continue
+        if key not in sum(TURNO_KEY_ALIASES.values(), ()):
+            if log:
+                log.warning("[normalize] chave de turno desconhecida ignorada: %r (n=%d)", key, len(raw[key] or []))
     return norm
+
+
+def raw_counts(raw: dict) -> dict[str, int]:
+    """Contagem bruta de itens por turno retornada pela API."""
+    counts: dict[str, int] = {}
+    if not raw:
+        return counts
+    for key, val in raw.items():
+        if isinstance(val, (list, tuple)):
+            counts[key] = len(val)
+    return counts
 
 
 TURNO_MAP = {

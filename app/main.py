@@ -1,8 +1,12 @@
+import logging
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from . import config
 from .routers import meta, availability
+
+logging.basicConfig(level=getattr(logging, config.LOG_LEVEL, logging.INFO),
+                    format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 
 app = FastAPI(title="API Williams Barbearia", version="1.0.0",
               description="Horários livres/ocupados (BestBarbers) para N8N/IA")
